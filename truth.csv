@@ -1,4 +1,0 @@
-dataset_id,classifier_id,true_auc
-toy,c1,0.85
-toy,c2,0.82
-toy,c3,0.76
