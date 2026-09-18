@@ -14,13 +14,14 @@ Component C implements the following four statistical metrics computed across ex
 
 1. **Winner-Correct Rate**:
    * For each replicate, compute each classifier's mean AUC across its five CV folds.
-   * The classifier with the highest mean observed AUC is the declared winner.
-   * Compares the declared winner against the genuinely best classifier from ground truth (`truth.csv`).
-   * Winner-correct rate is the proportion of valid replicates where the declared winner equals the true best classifier.
+   * The classifier with the highest mean observed AUC is the declared winner (Rule 1 applied for observed empirical ties).
+   * Compares the declared winner against the genuinely best classifier(s) from ground truth (`truth.csv`).
+   * **Truth-Tie Rule**: If two or more classifiers share the maximum true AUC in `truth.csv`, any declared winner belonging to the set of true best classifiers is credited as correct (`is_correct = 1`).
+   * Winner-correct rate is the proportion of valid replicates where the declared winner is in the set of true best classifiers.
 
 2. **Mean Kendall's Tau ($\tau$)**:
    * Ranks classifiers by their replicate-level mean observed AUC and by their true AUC.
-   * Computes Kendall's rank correlation coefficient ($\tau$) between the observed and true rankings using `scipy.stats.kendalltau`.
+   * Computes Kendall's rank correlation coefficient ($\tau$) between the observed and true rankings using `scipy.stats.kendalltau` ($\tau_b$, which explicitly adjusts for ties in ground-truth and observed vectors).
    * Mean Kendall's tau is the average of replicate-level $\tau$ values across valid replicates.
 
 3. **Mean Optimism**:
@@ -29,12 +30,13 @@ Component C implements the following four statistical metrics computed across ex
    * Measures the selection bias incurred when declaring the empirical winner.
 
 4. **Power for $c_1$ vs $c_2$ (Paired $t$-Test)**:
-   * Compares the genuinely superior classifier $c_1$ (`true_auc=0.85`) against $c_2$ (`true_auc=0.82`).
-   * Pairs corresponding fold AUCs (fold 1 with fold 1, fold 2 with fold 2, etc.) and performs a paired $t$-test using `scipy.stats.ttest_rel`.
-   * **Correct Detection** (Power): $p < 0.05$ and mean difference favors $c_1$ ($\text{mean}(c_1) > \text{mean}(c_2)$).
-   * **Sign Error**: $p < 0.05$ and mean difference favors $c_2$ ($\text{mean}(c_2) > \text{mean}(c_1)$).
-   * **No Detection**: $p \ge 0.05$ or mean difference equals zero.
-   * Power is the proportion of valid replicates yielding a correct detection. Sign-error rate is reported alongside power.
+   * Compares classifier $c_1$ against $c_2$ using paired fold AUCs (fold 1 with fold 1, fold 2 with fold 2, etc.) via `scipy.stats.ttest_rel`.
+   * **Truth-Superiority ($c_1 > c_2$)**:
+     * **Correct Detection** (Power): $p < 0.05$ and mean difference favors $c_1$ ($\text{mean}(c_1) > \text{mean}(c_2)$).
+     * **Sign Error**: $p < 0.05$ and mean difference favors $c_2$ ($\text{mean}(c_2) > \text{mean}(c_1)$).
+     * **No Detection**: $p \ge 0.05$ or mean difference equals zero.
+   * **Truth-Tie ($c_1 == c_2$)**:
+     * If $\text{true\_auc}(c_1) == \text{true\_auc}(c_2)$, the null hypothesis $H_0$ is true in reality. Any rejection ($p < 0.05$) is classified as a **Type I error (False Positive)** with $\text{Power} = 0$.
 
 ---
 
@@ -56,18 +58,22 @@ The repository contains three primary CSV data files:
 
 ---
 
-## Edge-Case Rules
+## Edge-Case & Truth-Tie Rules
 
-Component C strictly enforces the following 8 pre-specified edge-case and ambiguity rules:
+Component C strictly enforces the following edge-case, ambiguity, and truth-tie rules:
 
-1. **Rule 1 (Exact Tie in Mean AUC)**: If two or more classifiers tie for the highest observed mean AUC, select the classifier with the lexicographically smallest `classifier_id` (e.g. $c_1$ beats $c_2$).
-2. **Rule 2 (Non-Computable Fold AUC)**: Non-computable fold AUCs are treated as invalid and are never replaced with 0 or artificial values.
-3. **Rule 3 (Incomplete Replicate & Fold ID Integrity)**: Every required classifier must have exactly 5 valid fold rows with integer fold IDs matching the exact set $\{1, 2, 3, 4, 5\}$. Duplicates, non-integers, missing folds, or out-of-range IDs invalidate the replicate.
-4. **Rule 4 (Missing True AUC & Extra Classifiers)**: Ground truth is matched on both `dataset_id` and `classifier_id`. Every classifier appearing in results must have a valid numerical `true_auc` in `truth.csv`; missing entries or extra classifiers invalidate the replicate.
-5. **Rule 5 (Missing / Non-Numeric / NaN AUC)**: Missing or NaN fold AUCs invalidate the affected fold and exclude the replicate if fewer than 5 valid folds remain.
-6. **Rule 6 (Paired $t$-Test Cannot Be Performed)**: If paired folds cannot be matched, fold count $< 2$, diffs have zero variance, or $t$-test produces `NaN`/`inf`, the replicate is classified as **NO DETECTION** (`power=0`, `sign_error=0`).
-7. **Rule 7 ($p = 0.05$ Threshold)**: Detection strictly requires $p < 0.05$; $p \ge 0.05$ is classified as **NO DETECTION**.
-8. **Rule 8 (Mean Paired Difference = 0)**: If the mean paired difference is exactly zero, neither classifier is favored $\implies$ **NO DETECTION** (`power=0`, `sign_error=0`).
+1. **Rule 1 (Exact Tie in Empirical Mean AUC)**: If two or more classifiers tie for the highest observed mean AUC in a replicate, select the classifier with the lexicographically smallest `classifier_id` (e.g. $c_1$ beats $c_2$).
+2. **Truth-Tie Rule (Truth-Tie in Ground-Truth AUC)**:
+   * **Winner-Correct Rate**: If multiple classifiers share the maximum `true_auc` in `truth.csv`, any declared winner with `winner_true_auc == max_true_auc` receives `is_correct = 1` (no arbitrary penalization).
+   * **Paired $t$-Test**: If `true_auc(c1) == true_auc(c2)`, rejections with $p < 0.05$ are classified as Type I errors (False Positives) with `power = 0`.
+   * **Kendall's Tau**: Tie-adjusted Kendall's $\tau_b$ is used to handle ties in true AUCs.
+3. **Rule 2 (Non-Computable Fold AUC)**: Non-computable fold AUCs are treated as invalid and are never replaced with 0 or artificial values.
+4. **Rule 3 (Incomplete Replicate & Fold ID Integrity)**: Every required classifier must have exactly 5 valid fold rows with integer fold IDs matching the exact set $\{1, 2, 3, 4, 5\}$. Duplicates, non-integers, missing folds, or out-of-range IDs invalidate the replicate.
+5. **Rule 4 (Missing True AUC & Extra Classifiers)**: Ground truth is matched on both `dataset_id` and `classifier_id`. Every classifier appearing in results must have a valid numerical `true_auc` in `truth.csv`; missing entries or extra classifiers invalidate the replicate.
+6. **Rule 5 (Missing / Non-Numeric / NaN AUC)**: Missing or NaN fold AUCs invalidate the affected fold and exclude the replicate if fewer than 5 valid folds remain.
+7. **Rule 6 (Paired $t$-Test Cannot Be Performed)**: If paired folds cannot be matched, fold count $< 2$, diffs have zero variance, or $t$-test produces `NaN`/`inf`, the replicate is classified as **NO DETECTION** (`power=0`, `sign_error=0`).
+8. **Rule 7 ($p = 0.05$ Threshold)**: Detection strictly requires $p < 0.05$; $p \ge 0.05$ is classified as **NO DETECTION**.
+9. **Rule 8 (Mean Paired Difference = 0)**: If the mean paired difference is exactly zero, neither classifier is favored $\implies$ **NO DETECTION** (`power=0`, `sign_error=0`).
 
 ---
 
@@ -75,7 +81,7 @@ Component C strictly enforces the following 8 pre-specified edge-case and ambigu
 
 The pipeline has been thoroughly verified:
 * **10 Synthetic Dataset Validation Checks**: Passed (`generate_synthetic_results.py`).
-* **13 Automated Unit Tests**: Passed (`component_c.py`), covering all 8 edge cases and sample-size independence.
+* **16 Automated Unit Tests**: Passed (`component_c.py`), covering all 8 edge cases, truth-tie rules, and sample-size independence.
 * **Toy Hand-Calculation Verification**: Passed (`toy_results.csv`), exactly reproducing theoretical values.
 
 ---
@@ -128,12 +134,12 @@ FINAL STATISTICAL SUMMARY BY SAMPLE SIZE
 
 ### 1. Generate & Validate Synthetic Dataset
 ```bash
-python3 generate_synthetic_results.py
+python3 "Week 1/generate_synthetic_results.py"
 ```
 
 ### 2. Run Statistical Evaluation & Automated Test Suite
 ```bash
-python3 component_c.py
+python3 "Week 1/component_c.py"
 ```
 
 ---
@@ -156,10 +162,10 @@ pip install numpy pandas scipy
 
 | File | Description |
 | :--- | :--- |
-| `component_c.py` | Core statistical calculations, sample-size evaluation, 8 edge-case rules, and 13 unit tests. |
+| `component_c.py` | Core statistical calculations, sample-size evaluation, 8 edge-case rules, Truth-Tie rules, and 16 unit tests. |
 | `generate_synthetic_results.py` | Reproducible generator and validator for the 600-row synthetic results dataset. |
 | `truth.csv` | Ground truth classifier AUC benchmark values ($c_1=0.85, c_2=0.82, c_3=0.76$). |
 | `toy_results.csv` | 15-row assignment toy test dataset used for hand-calculation verification. |
 | `results.csv` | 600-row experimental 5-fold CV results across 40 replicates ($N=100$ and $N=500$). |
-| `README.md` | Comprehensive documentation and verification summary for Component C. |
+| `README.md` | Comprehensive documentation, truth-tie specification, and verification summary for Component C. |
 | `.gitignore` | Standard Git ignore configuration for Python, macOS, and IDE artifacts. |

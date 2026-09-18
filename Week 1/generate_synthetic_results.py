@@ -17,9 +17,21 @@ Specification:
 - Values clipped to [0.0, 1.0] and rounded to 4 decimal places.
 """
 
+import os
 import sys
 import numpy as np
 import pandas as pd
+
+
+def _resolve_filepath(path: str) -> str:
+    """Resolve file path relative to current working directory or script directory."""
+    if os.path.exists(path):
+        return path
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidate = os.path.join(script_dir, path)
+    if os.path.exists(candidate):
+        return candidate
+    return path
 
 
 def generate_synthetic_results(
@@ -30,6 +42,9 @@ def generate_synthetic_results(
     """
     Generate 600-row synthetic results dataset with principled sampling variability.
     """
+    truth_path = _resolve_filepath(truth_path)
+    output_path = _resolve_filepath(output_path)
+
     # Load ground truth values
     truth_df = pd.read_csv(truth_path)
     true_auc_map = dict(zip(truth_df["classifier_id"], truth_df["true_auc"]))

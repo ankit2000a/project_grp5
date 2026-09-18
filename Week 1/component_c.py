@@ -6,16 +6,28 @@ This module implements the calculation and validation of the four statistical me
 1. Winner-correct rate
 2. Mean Kendall's tau
 3. Mean optimism
-4. Power (and Sign-error rate) for named pair c1 vs c2 via paired t-tests
+4. Power (and Sign-error / Type I error rate) for pair c1 vs c2 via paired t-tests
 
 ==============================================================================
-EXPLICIT SPECIFICATION OF THE 8 PRE-SPECIFIED EDGE-CASE RULES
+EXPLICIT SPECIFICATION OF THE EDGE-CASE AND TRUTH-TIE RULES
 ==============================================================================
 
-Rule 1: EXACT TIE IN MEAN AUC
-- If two or more classifiers have exactly the same highest mean AUC, select the
-  classifier with the smallest classifier_id in lexicographical order as the declared winner.
-  Example: c1 = 0.820, c2 = 0.820 -> Winner is c1.
+Rule 1: EXACT TIE IN EMPIRICAL MEAN AUC (Observed Replicate Tie)
+- If two or more classifiers have exactly the same highest observed mean AUC,
+  break the empirical tie deterministically by selecting the classifier with the
+  lexicographically smallest classifier_id (ascending order).
+  Example: observed c1 = 0.820, c2 = 0.820 -> Declared winner is c1.
+
+Truth-Tie Rule: TRUTH-TIE IN GROUND-TRUTH AUC
+- If two or more classifiers share the maximum true_auc in truth.csv for a dataset:
+  * All classifiers achieving this maximum true AUC are genuinely the best classifiers.
+  * Winner-Correct Rate: If the declared winner belongs to the set of true best classifiers
+    (i.e. winner_true_auc == max_true_auc), is_correct = 1 (credited as correct).
+  * Paired t-Test Power (c1 vs c2): If true_auc(c1) == true_auc(c2), the null hypothesis H0
+    is true in reality. Any statistically significant rejection (p < 0.05) is a Type I error
+    (False Positive), NOT power (correct detection). Power is defined as 0.
+  * Kendall's Tau: Rank correlation is evaluated using Kendall's tau-b, which explicitly
+    adjusts for ties in ground truth and observed rankings.
 
 Rule 2: NON-COMPUTABLE FOLD AUC
 - If a fold's AUC cannot be computed, treat that fold as invalid.
@@ -52,11 +64,23 @@ Rule 8: MEAN PAIRED DIFFERENCE = 0
 - Therefore, it cannot be classified as a correct detection or a sign error (classified as NO DETECTION).
 """
 
+import os
 import sys
 from typing import Dict, List, Optional, Tuple, Any, Union
 import numpy as np
 import pandas as pd
 from scipy import stats
+
+
+def _resolve_filepath(path: str) -> str:
+    """Resolve file path relative to current working directory or script directory."""
+    if os.path.exists(path):
+        return path
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidate = os.path.join(script_dir, path)
+    if os.path.exists(candidate):
+        return candidate
+    return path
 
 
 def load_datasets(
@@ -66,6 +90,11 @@ def load_datasets(
     """
     Load ground truth and results CSV files or dataframes, cleanly coercing types and trimming whitespace.
     """
+    if isinstance(truth_source, str):
+        truth_source = _resolve_filepath(truth_source)
+    if isinstance(results_source, str):
+        results_source = _resolve_filepath(results_source)
+
     truth_df = (
         pd.read_csv(truth_source)
         if isinstance(truth_source, str)
@@ -214,19 +243,44 @@ def get_declared_winner(replicate_summary: pd.DataFrame) -> Tuple[str, float]:
     return str(winner_row["classifier_id"]), float(winner_row["mean_auc"])
 
 
+def get_true_best_classifiers(
+    truth_df: pd.DataFrame, dataset_id: str
+) -> Tuple[List[str], float, bool]:
+    """
+    Determine the genuinely best classifier(s) from ground truth for the given dataset_id.
+    Truth-Tie Rule: Returns ALL classifiers achieving the maximum true AUC.
+
+    Returns:
+        best_classifiers (List[str]): List of classifier IDs sharing the maximum true AUC.
+        max_true_auc (float): Maximum true AUC value.
+        is_truth_tie (bool): True if more than one classifier achieves the maximum true AUC.
+    """
+    truth_subset = truth_df[truth_df["dataset_id"] == dataset_id]
+    if truth_subset.empty:
+        raise ValueError(f"No ground truth entries found for dataset_id '{dataset_id}'.")
+
+    max_true_auc = float(truth_subset["true_auc"].max())
+    best_clfs = sorted(
+        truth_subset[
+            np.isclose(truth_subset["true_auc"], max_true_auc, atol=1e-9)
+        ]["classifier_id"]
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+    is_truth_tie = len(best_clfs) > 1
+    return best_clfs, max_true_auc, is_truth_tie
+
+
 def get_true_best_classifier(
     truth_df: pd.DataFrame, dataset_id: str
 ) -> Tuple[str, float]:
     """
     Determine the genuinely best classifier from ground truth for the given dataset_id.
-    Tie-breaking: Lexicographically smallest classifier_id if true AUCs tie.
+    Compatible wrapper for single classifier representation.
     """
-    truth_subset = truth_df[truth_df["dataset_id"] == dataset_id]
-    sorted_truth = truth_subset.sort_values(
-        by=["true_auc", "classifier_id"], ascending=[False, True]
-    )
-    best_row = sorted_truth.iloc[0]
-    return str(best_row["classifier_id"]), float(best_row["true_auc"])
+    best_clfs, max_auc, _ = get_true_best_classifiers(truth_df, dataset_id)
+    return best_clfs[0], max_auc
 
 
 def compute_winner_correct(
@@ -234,20 +288,24 @@ def compute_winner_correct(
 ) -> Dict[str, Any]:
     """
     1. Winner-correct rate:
-    - Declared winner: highest observed replicate mean AUC (Rule 1 applied for ties).
-    - True best: highest true_auc from truth.csv for dataset_id.
-    - Correct = 1 if declared_winner == true_best else 0.
+    - Declared winner: highest observed replicate mean AUC (Rule 1 applied for observed ties).
+    - True best: all classifiers achieving maximum true_auc from truth.csv for dataset_id (truth-ties preserved).
+    - Correct = 1 if declared_winner is in the set of true best classifiers, else 0.
     """
     declared_winner, declared_mean_auc = get_declared_winner(replicate_summary)
-    true_best, true_best_auc = get_true_best_classifier(truth_df, dataset_id)
+    true_bests, true_best_auc, is_truth_tie = get_true_best_classifiers(
+        truth_df, dataset_id
+    )
 
-    is_correct = 1 if declared_winner == true_best else 0
+    is_correct = 1 if declared_winner in true_bests else 0
     return {
         "is_correct": is_correct,
         "declared_winner": declared_winner,
         "declared_mean_auc": declared_mean_auc,
-        "true_best": true_best,
+        "true_best": ", ".join(true_bests) if len(true_bests) > 1 else true_bests[0],
+        "true_best_classifiers": true_bests,
         "true_best_auc": true_best_auc,
+        "is_truth_tie": is_truth_tie,
     }
 
 
@@ -258,7 +316,7 @@ def compute_kendall_tau(
     2. Kendall's tau:
     - Filter truth.csv to dataset_id.
     - Match and merge on BOTH dataset_id and classifier_id.
-    - Rank classifiers by observed mean AUC vs true_auc using scipy.stats.kendalltau.
+    - Rank classifiers by observed mean AUC vs true_auc using scipy.stats.kendalltau (tau-b with tie handling).
     """
     truth_subset = truth_df[truth_df["dataset_id"] == dataset_id]
 
@@ -330,22 +388,41 @@ def compute_power_c1_vs_c2(
     alpha: float = 0.05,
 ) -> Dict[str, Any]:
     """
-    4. Power for c1 vs c2:
-    - Named pair c1 and c2. Ground truth verified: true_auc(c1) > true_auc(c2).
-    - Pair fold 1 of c1 with fold 1 of c2, fold 2 with fold 2, etc.
-    - Differences: c1 - c2.
+    4. Power (and Sign-error / Type I error rate) for pair c1 vs c2:
+    - Pairs corresponding fold AUCs (fold 1 with fold 1, etc.). Differences: c1 - c2.
+    - Ground-truth evaluation:
+        * If true_auc(c1) > true_auc(c2): c1 is genuinely superior.
+          Rejection favoring c1 (mean_diff > 0, p < alpha) is CORRECT DETECTION (Power=1, SignError=0).
+          Rejection favoring c2 (mean_diff < 0, p < alpha) is SIGN ERROR (Power=0, SignError=1).
+        * If true_auc(c1) < true_auc(c2): c2 is genuinely superior.
+          Rejection favoring c2 (mean_diff < 0, p < alpha) is CORRECT DETECTION (Power=1, SignError=0).
+          Rejection favoring c1 (mean_diff > 0, p < alpha) is SIGN ERROR (Power=0, SignError=1).
+        * If true_auc(c1) == true_auc(c2) (TRUTH-TIE): H0 is true in reality.
+          Neither classifier is genuinely superior. Any rejection (p < alpha) is a
+          TYPE I ERROR / FALSE POSITIVE (Power=0, SignError=0, Type1Error=1).
     - Rule 6: Insufficient folds, mismatched fold IDs, zero variance, or ttest failure -> NO DETECTION.
-    - Rule 7: Detection requires p < 0.05 (p = 0.05 is NO DETECTION).
+    - Rule 7: Detection strictly requires p < 0.05 (p = 0.05 is NO DETECTION).
     - Rule 8: Mean paired difference == 0 -> NO DETECTION.
-    - Correct detection: p < alpha AND mean difference > 0 (favors c1).
-    - Sign error: p < alpha AND mean difference < 0 (favors c2).
-    - No detection: p >= alpha OR mean difference == 0.
     """
     c1_folds = replicate_df[replicate_df["classifier_id"] == c1_id].sort_values(
         by="fold_id"
     )
     c2_folds = replicate_df[replicate_df["classifier_id"] == c2_id].sort_values(
         by="fold_id"
+    )
+
+    # Check truth relationship between c1 and c2
+    truth_subset = truth_df[truth_df["dataset_id"] == dataset_id]
+    c1_truth = truth_subset[truth_subset["classifier_id"] == c1_id]
+    c2_truth = truth_subset[truth_subset["classifier_id"] == c2_id]
+
+    c1_true_auc = float(c1_truth["true_auc"].iloc[0]) if not c1_truth.empty else np.nan
+    c2_true_auc = float(c2_truth["true_auc"].iloc[0]) if not c2_truth.empty else np.nan
+
+    is_truth_tie = (
+        not np.isnan(c1_true_auc)
+        and not np.isnan(c2_true_auc)
+        and np.isclose(c1_true_auc, c2_true_auc, atol=1e-9)
     )
 
     # Rule 6: Check fold matching and count
@@ -365,6 +442,8 @@ def compute_power_c1_vs_c2(
             "p_value": 1.0,
             "power": 0,
             "sign_error": 0,
+            "type1_error": 0,
+            "is_truth_tie": is_truth_tie,
             "outcome": "NO DETECTION (Rule 6: Insufficient/unmatched paired folds)",
         }
 
@@ -384,6 +463,8 @@ def compute_power_c1_vs_c2(
             "p_value": 1.0,
             "power": 0,
             "sign_error": 0,
+            "type1_error": 0,
+            "is_truth_tie": is_truth_tie,
             "outcome": "NO DETECTION (Rule 8: Mean difference = 0.0)",
         }
 
@@ -399,6 +480,8 @@ def compute_power_c1_vs_c2(
             "p_value": np.nan,
             "power": 0,
             "sign_error": 0,
+            "type1_error": 0,
+            "is_truth_tie": is_truth_tie,
             "outcome": "NO DETECTION (Rule 6: Degenerate paired t-test / zero variance)",
         }
 
@@ -421,22 +504,45 @@ def compute_power_c1_vs_c2(
             "p_value": np.nan,
             "power": 0,
             "sign_error": 0,
+            "type1_error": 0,
+            "is_truth_tie": is_truth_tie,
             "outcome": "NO DETECTION (Rule 6: Degenerate t-test)",
         }
 
-    # Rule 7: Detection strictly requires p < alpha (p = 0.05 is NO DETECTION)
-    if p_val < alpha and mean_diff > 0:
-        power = 1
-        sign_error = 0
-        outcome = "CORRECT DETECTION (p < 0.05, favors c1)"
-    elif p_val < alpha and mean_diff < 0:
-        power = 0
-        sign_error = 1
-        outcome = "SIGN ERROR (p < 0.05, favors c2)"
+    # Evaluate detection outcome according to ground truth relationship
+    power = 0
+    sign_error = 0
+    type1_error = 0
+
+    if p_val < alpha:
+        if is_truth_tie:
+            # Truth tie: H0 is true in ground truth -> rejection is Type I error / False Positive
+            type1_error = 1
+            outcome = (
+                f"TYPE I ERROR / FALSE POSITIVE (Truth Tie: true_auc({c1_id}) == "
+                f"true_auc({c2_id}) == {c1_true_auc:.4f}, p < {alpha})"
+            )
+        elif np.isnan(c1_true_auc) or np.isnan(c2_true_auc) or c1_true_auc > c2_true_auc:
+            # c1 is genuinely superior (default benchmark scenario)
+            if mean_diff > 0:
+                power = 1
+                outcome = f"CORRECT DETECTION (p < {alpha}, favors {c1_id})"
+            else:
+                sign_error = 1
+                outcome = f"SIGN ERROR (p < {alpha}, favors {c2_id})"
+        else:
+            # c2 is genuinely superior
+            if mean_diff < 0:
+                power = 1
+                outcome = f"CORRECT DETECTION (p < {alpha}, favors {c2_id})"
+            else:
+                sign_error = 1
+                outcome = f"SIGN ERROR (p < {alpha}, favors {c1_id})"
     else:
-        power = 0
-        sign_error = 0
-        outcome = "NO DETECTION (p >= 0.05)"
+        if is_truth_tie:
+            outcome = f"CORRECT RETENTION OF NULL (Truth Tie: p >= {alpha})"
+        else:
+            outcome = f"NO DETECTION (p >= {alpha})"
 
     return {
         "c1_auc_folds": c1_vals.tolist(),
@@ -447,6 +553,8 @@ def compute_power_c1_vs_c2(
         "p_value": p_val,
         "power": power,
         "sign_error": sign_error,
+        "type1_error": type1_error,
+        "is_truth_tie": is_truth_tie,
         "outcome": outcome,
     }
 
@@ -526,6 +634,9 @@ def evaluate_dataset(
     sign_error_rate = float(
         np.mean([r["power_c1_c2"]["sign_error"] for r in replicate_records])
     )
+    type1_error_rate = float(
+        np.mean([r["power_c1_c2"]["type1_error"] for r in replicate_records])
+    )
 
     results = {
         "valid_replicates_count": len(replicate_records),
@@ -535,6 +646,7 @@ def evaluate_dataset(
         "mean_optimism": mean_optimism,
         "power": power_rate,
         "sign_error_rate": sign_error_rate,
+        "type1_error_rate": type1_error_rate,
         "replicates": replicate_records,
     }
 
@@ -587,6 +699,8 @@ def evaluate_by_sample_size(
             print(f"  3. Mean optimism            : {res['mean_optimism']:.6f}")
             print(f"  4. Power (c1 vs c2)         : {res['power']:.4f}")
             print(f"     Sign-error rate          : {res['sign_error_rate']:.4f}")
+            if res['type1_error_rate'] > 0:
+                print(f"     Type I error rate        : {res['type1_error_rate']:.4f}")
             print("-" * 45)
 
         print("=" * 78)
@@ -631,9 +745,14 @@ def print_detailed_report(
         print(
             f"  Observed Winner : {wc['declared_winner']} (Mean AUC = {wc['declared_mean_auc']:.4f})"
         )
-        print(
-            f"  True Winner     : {wc['true_best']} (True AUC = {wc['true_best_auc']:.4f})"
-        )
+        if wc.get("is_truth_tie", False):
+            print(
+                f"  True Winner(s)  : {wc['true_best']} (TRUTH-TIE Tied Max True AUC = {wc['true_best_auc']:.4f})"
+            )
+        else:
+            print(
+                f"  True Winner     : {wc['true_best']} (True AUC = {wc['true_best_auc']:.4f})"
+            )
         print(f"  Is Correct?     : {bool(wc['is_correct'])}")
         print(f"  >> Winner-Correct Score = {wc['is_correct']}")
 
@@ -649,7 +768,7 @@ def print_detailed_report(
         print(
             f"  scipy.stats.kendalltau statistic = {kt['tau']:.10f} (p-value = {kt['p_value']:.4f})"
         )
-        print(f"  >> Kendall's tau = {kt['tau']:.10f} (Exact 1/3 = {1/3:.10f})")
+        print(f"  >> Kendall's tau = {kt['tau']:.10f}")
 
         opt = rep["optimism"]
         print("\n[D] Statistic 3: Mean Optimism")
@@ -674,6 +793,8 @@ def print_detailed_report(
         print(f"  Classification      : {pw['outcome']}")
         print(f"  >> Power (Detection) = {pw['power']}")
         print(f"  >> Sign Error        = {pw['sign_error']}")
+        if pw.get("type1_error", 0) > 0:
+            print(f"  >> Type I Error      = {pw['type1_error']}")
 
     print("\n" + "=" * 78)
     print("SUMMARY OF THE FOUR STATISTICS")
@@ -684,6 +805,8 @@ def print_detailed_report(
     print(f"  3. Mean optimism          : {results['mean_optimism']:.6f}")
     print(f"  4. Power (c1 vs c2)       : {results['power']}")
     print(f"     Sign-error rate        : {results['sign_error_rate']}")
+    if results.get("type1_error_rate", 0) > 0:
+        print(f"     Type I error rate      : {results['type1_error_rate']}")
     print("=" * 78)
 
 
@@ -703,6 +826,9 @@ def run_unit_tests():
     11. Rule 7: p >= 0.05 boundary is classified as NO DETECTION.
     12. Rule 8: Mean paired difference = 0 classified as NO DETECTION.
     13. Sample Size Separation: evaluate_by_sample_size independently evaluates n_sub=100 and n_sub=500.
+    14. Truth-Tie Rule (Winner-Correct): Multiple classifiers tied in truth for max AUC are all credited.
+    15. Truth-Tie Rule (Paired t-Test): When true_auc(c1) == true_auc(c2), p < 0.05 is Type I Error, not Power.
+    16. Truth-Tie Rule (Kendall's Tau): Evaluates Kendall tau-b accurately when truth contains ties.
     """
     print("\n" + "#" * 78)
     print("STARTING AUTOMATED VERIFICATION TESTS (COMPONENT C)")
@@ -750,7 +876,7 @@ def run_unit_tests():
     truth_df, toy_df = load_datasets("truth.csv", "toy_results.csv")
 
     # ==========================================================
-    # TEST 2: Rule 1 - Exact Tie in Mean AUC
+    # TEST 2: Rule 1 - Exact Tie in Mean AUC (Observed Replicate Tie)
     # ==========================================================
     print("\n[TEST 2] Testing Rule 1 (Exact Tie in Mean AUC -> Lexicographical Tie Break)...")
     tie_summary = pd.DataFrame({
@@ -928,6 +1054,106 @@ def run_unit_tests():
     test_results.append(("13. Sample Size Independent Evaluation", rule13_passed))
 
     # ==========================================================
+    # TEST 14: Truth-Tie Rule in Ground-Truth AUC for Winner-Correct Rate
+    # ==========================================================
+    print("\n[TEST 14] Testing Truth-Tie Rule for Winner-Correct Rate...")
+    truth_tied_df = pd.DataFrame({
+        "dataset_id": ["tied_ds", "tied_ds", "tied_ds"],
+        "classifier_id": ["c1", "c2", "c3"],
+        "true_auc": [0.85, 0.85, 0.76],  # c1 and c2 tied in ground truth for max AUC
+    })
+
+    # Case A: Declared winner is c1 (tied true best) -> is_correct = 1
+    rep_summary_c1 = pd.DataFrame({
+        "dataset_id": ["tied_ds", "tied_ds", "tied_ds"],
+        "classifier_id": ["c1", "c2", "c3"],
+        "mean_auc": [0.86, 0.84, 0.75],
+    })
+    wc_c1 = compute_winner_correct(rep_summary_c1, truth_tied_df, "tied_ds")
+    pass_wc_c1 = (wc_c1["is_correct"] == 1) and (wc_c1["declared_winner"] == "c1") and wc_c1["is_truth_tie"]
+
+    # Case B: Declared winner is c2 (tied true best) -> is_correct = 1 (crucial truth-tie test!)
+    rep_summary_c2 = pd.DataFrame({
+        "dataset_id": ["tied_ds", "tied_ds", "tied_ds"],
+        "classifier_id": ["c1", "c2", "c3"],
+        "mean_auc": [0.83, 0.87, 0.75],
+    })
+    wc_c2 = compute_winner_correct(rep_summary_c2, truth_tied_df, "tied_ds")
+    pass_wc_c2 = (wc_c2["is_correct"] == 1) and (wc_c2["declared_winner"] == "c2") and wc_c2["is_truth_tie"]
+
+    # Case C: Declared winner is c3 (inferior true AUC) -> is_correct = 0
+    rep_summary_c3 = pd.DataFrame({
+        "dataset_id": ["tied_ds", "tied_ds", "tied_ds"],
+        "classifier_id": ["c1", "c2", "c3"],
+        "mean_auc": [0.80, 0.81, 0.89],
+    })
+    wc_c3 = compute_winner_correct(rep_summary_c3, truth_tied_df, "tied_ds")
+    pass_wc_c3 = (wc_c3["is_correct"] == 0) and (wc_c3["declared_winner"] == "c3")
+
+    test14_passed = pass_wc_c1 and pass_wc_c2 and pass_wc_c3
+    print(
+        f"  - Truth-Tied (c1=0.85, c2=0.85): Declared c1 is correct = {wc_c1['is_correct']} (Expected 1) -> {'PASS' if pass_wc_c1 else 'FAIL'}"
+    )
+    print(
+        f"  - Truth-Tied (c1=0.85, c2=0.85): Declared c2 is correct = {wc_c2['is_correct']} (Expected 1) -> {'PASS' if pass_wc_c2 else 'FAIL'}"
+    )
+    print(
+        f"  - Truth-Tied (c1=0.85, c2=0.85): Declared c3 is correct = {wc_c3['is_correct']} (Expected 0) -> {'PASS' if pass_wc_c3 else 'FAIL'}"
+    )
+    test_results.append(("14. Truth-Tie Winner-Correct Rate Verification", test14_passed))
+
+    # ==========================================================
+    # TEST 15: Truth-Tie Rule in Paired t-Test (c1 vs c2) -> Type I Error
+    # ==========================================================
+    print("\n[TEST 15] Testing Truth-Tie Rule in Paired t-Test (Type I Error under H0)...")
+    # Ground truth with exact truth-tie between c1 and c2
+    truth_pair_tie = pd.DataFrame({
+        "dataset_id": ["pair_tie", "pair_tie"],
+        "classifier_id": ["c1", "c2"],
+        "true_auc": [0.85, 0.85],
+    })
+    # Simulated replicate where sample noise produced statistically significant p < 0.05
+    rep_sig_noise = pd.DataFrame({
+        "dataset_id": ["pair_tie"] * 10,
+        "replicate_id": [1] * 10,
+        "classifier_id": ["c1"] * 5 + ["c2"] * 5,
+        "fold_id": [1, 2, 3, 4, 5, 1, 2, 3, 4, 5],
+        "auc": [0.90, 0.89, 0.91, 0.88, 0.90, 0.80, 0.81, 0.79, 0.82, 0.80],
+    })
+    pw_truth_tie = compute_power_c1_vs_c2(rep_sig_noise, truth_pair_tie, "pair_tie")
+    pass_t1_err = (
+        pw_truth_tie["power"] == 0
+        and pw_truth_tie["type1_error"] == 1
+        and "TYPE I ERROR" in pw_truth_tie["outcome"]
+    )
+    print(
+        f"  - Truth-Tie c1=0.85, c2=0.85 with p < 0.05 -> Power = {pw_truth_tie['power']} (Expected 0), "
+        f"Type I Error = {pw_truth_tie['type1_error']} (Expected 1) -> {'PASS' if pass_t1_err else 'FAIL'}"
+    )
+    test_results.append(("15. Truth-Tie Paired t-Test Type I Error Verification", pass_t1_err))
+
+    # ==========================================================
+    # TEST 16: Truth-Tie Rule in Kendall's Tau Calculation
+    # ==========================================================
+    print("\n[TEST 16] Testing Truth-Tie Handling in Kendall's Tau...")
+    truth_tied_kt = pd.DataFrame({
+        "dataset_id": ["tied_kt", "tied_kt", "tied_kt"],
+        "classifier_id": ["c1", "c2", "c3"],
+        "true_auc": [0.85, 0.85, 0.76],
+    })
+    rep_summary_kt = pd.DataFrame({
+        "dataset_id": ["tied_kt", "tied_kt", "tied_kt"],
+        "classifier_id": ["c1", "c2", "c3"],
+        "mean_auc": [0.84, 0.86, 0.75],
+    })
+    kt_res = compute_kendall_tau(rep_summary_kt, truth_tied_kt, "tied_kt")
+    pass_kt_tie = not np.isnan(kt_res["tau"]) and isinstance(kt_res["tau"], float)
+    print(
+        f"  - Kendall's tau with tied truth values: tau = {kt_res['tau']:.6f} -> {'PASS' if pass_kt_tie else 'FAIL'}"
+    )
+    test_results.append(("16. Truth-Tie Kendall's Tau Verification", pass_kt_tie))
+
+    # ==========================================================
     # SUMMARY OF ALL TESTS
     # ==========================================================
     print("\n" + "=" * 78)
@@ -936,13 +1162,13 @@ def run_unit_tests():
     all_passed = True
     for name, status in test_results:
         status_str = "PASS" if status else "FAIL"
-        print(f"  {name:<55}: [{status_str}]")
+        print(f"  {name:<60}: [{status_str}]")
         if not status:
             all_passed = False
     print("=" * 78)
 
     if all_passed:
-        print("[ALL 13 TEST SUITES PASSED PERFECTLY!]")
+        print(f"[ALL {len(test_results)} TEST SUITES PASSED PERFECTLY!]")
     else:
         print("[SOME TESTS FAILED!]")
         sys.exit(1)
