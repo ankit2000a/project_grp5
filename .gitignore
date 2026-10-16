@@ -13,8 +13,15 @@ ENV/
 env/
 .env
 
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
 # macOS
 .DS_Store
+.AppleDouble
+.LSOverride
 
 # IDE and Editor files
 .idea/

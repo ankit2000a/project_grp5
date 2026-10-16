@@ -1,0 +1,13 @@
+pair,type,n_sub,true_gap_at_n,power_Ver_A,sign_error_Ver_A,power_Ver_B,sign_error_Ver_B
+gb vs knn,Close Pair,50,0.0016,0.05,0.04,0.05,0.04
+gb vs knn,Close Pair,100,0.0183,0.08,0.01,0.08,0.01
+gb vs knn,Close Pair,200,0.0406,0.14,0.0,0.14,0.0
+gb vs knn,Close Pair,500,0.0634,0.38,0.0,0.38,0.0
+logreg vs dtree,Wide Pair,50,0.129,0.18,0.0,0.18,0.0
+logreg vs dtree,Wide Pair,100,0.1494,0.42,0.0,0.42,0.0
+logreg vs dtree,Wide Pair,200,0.1558,0.52,0.0,0.52,0.0
+logreg vs dtree,Wide Pair,500,0.1415,0.87,0.0,0.87,0.0
+svm vs logreg,Reversal Pair,50,-0.0981,0.03,0.01,0.01,0.03
+svm vs logreg,Reversal Pair,100,-0.019,0.05,0.04,0.04,0.05
+svm vs logreg,Reversal Pair,200,0.0021,0.03,0.01,0.03,0.01
+svm vs logreg,Reversal Pair,500,0.0121,0.13,0.01,0.13,0.01
