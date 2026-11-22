@@ -1,9 +1,16 @@
 # Component C — The Statistical Evaluation Layer
 ## CSIT332: Principles of Machine Learning · Semester Project
 
-**Group:** Group 5  
+**Official Course Group:** Group 2  
+**General Team Identity:** Group 5  
 **Component:** Component C (Statistical Layer & Model Evaluation Benchmark)  
 **Academic Term:** Fifth Semester (Fall 2026)  
+
+### Team Members
+- Akshay
+- Jitendra
+- Shaun
+- Krishang  
 
 ---
 
